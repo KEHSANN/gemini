@@ -70,7 +70,6 @@ class ContactGoalCommand(CommandTerm):
     self._goal_pos_w = torch.zeros(N, NUM_FEET, NUM_SWITCHES, 3, device=dev)
     self._goal_pos_w[..., 2] = cfg.foot_target_height
     self._goal_contact = torch.zeros(N, NUM_FEET, NUM_SWITCHES, device=dev)
-    self._last_foot_dist = torch.zeros(N, NUM_FEET, device=dev)
     self._phase_cache = None
 
     # Goal-discovery bookkeeping.
@@ -167,9 +166,11 @@ class ContactGoalCommand(CommandTerm):
     centroid = self._goal_pos_w[:, :, 0, :2].mean(dim=1)
     dist_base = torch.norm(base_xy - centroid, dim=-1)
 
+    foot_xy = self.foot_pos_w()[:, :, :2]
+    foot_err_xy = torch.norm(self._goal_pos_w[:, :, 0, :2] - foot_xy, dim=-1)
     stance_mask = (self._goal_contact[:, :, 0] > 0.5).float()
     stance_cnt = torch.clamp(stance_mask.sum(dim=1), min=1.0)
-    stance_foot_err = (self._last_foot_dist * stance_mask).sum(dim=1) / stance_cnt
+    stance_foot_err = (foot_err_xy * stance_mask).sum(dim=1) / stance_cnt
 
     reached = (
       (dist_base < self.cfg.goal_proximity_threshold)
@@ -189,7 +190,6 @@ class ContactGoalCommand(CommandTerm):
     self._skip_metrics.fill_(False)
     foot = self.foot_pos_w()
     dist = torch.norm(self._goal_pos_w[:, :, 0, :] - foot, dim=-1)  # [N, 4]
-    self._last_foot_dist.copy_(dist)
     self._m_steps += valid
     self._m_track += valid * dist.mean(dim=1)
     denom = torch.clamp(self._m_steps, min=1.0)

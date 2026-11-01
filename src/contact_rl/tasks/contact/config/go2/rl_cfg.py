@@ -38,13 +38,18 @@ class RslRlRnnModelCfg(RslRlModelCfg):
   rnn_num_layers: int = 1
 
 
-def unitree_go2_ppo_runner_cfg(improved: bool = True) -> RslRlOnPolicyRunnerCfg:
-  """PPO runner cfg with running observation normalisation and fast schedule."""
+def unitree_go2_ppo_runner_cfg(improved: bool = False) -> RslRlOnPolicyRunnerCfg:
+  """PPO runner cfg with running observation normalisation and fast schedule.
+
+  ``improved=False`` keeps ``experiment_name="go2_contact"`` so ``runs/go2_contact``
+  is used by default (matching all VPS scripts), while enabling observation
+  normalisation and fast PPO convergence on both tasks.
+  """
   return RslRlOnPolicyRunnerCfg(
     actor=RslRlRnnModelCfg(
       hidden_dims=(512, 256, 128),
       activation="elu",
-      obs_normalization=improved,
+      obs_normalization=True,
       rnn_type="gru",
       rnn_hidden_dim=256,
       rnn_num_layers=1,
@@ -57,7 +62,7 @@ def unitree_go2_ppo_runner_cfg(improved: bool = True) -> RslRlOnPolicyRunnerCfg:
     critic=RslRlRnnModelCfg(
       hidden_dims=(512, 256, 128),
       activation="elu",
-      obs_normalization=improved,
+      obs_normalization=True,
       rnn_type="gru",
       rnn_hidden_dim=256,
       rnn_num_layers=1,
