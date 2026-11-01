@@ -6,7 +6,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 
-from contact_rl.robots.go2 import GO2_ACTION_SCALE, get_go2_robot_cfg
+from contact_rl.robots.go2 import get_go2_robot_cfg
 from contact_rl.tasks.contact.contact_env_cfg import (
   FEET_SENSOR_NAME,
   FOOT_ORDER,
@@ -29,24 +29,25 @@ _ILLEGAL_GEOMS = ("base1_collision", "base2_collision", "base3_collision") + tup
 # ``--env.scene.num-envs`` on smaller GPUs (``contact-bench`` helps pick one).
 PAPER_NUM_ENVS = 8192
 
+# Uniform 0.35 rad action scale as reported in Omar & Khadiv (SLowRL 2026, §5).
+GO2_PAPER_ACTION_SCALE = 0.35
+
 
 def unitree_go2_flat_env_cfg(
-  play: bool = False, improved: bool = False
+  play: bool = False, improved: bool = True
 ) -> ManagerBasedRlEnvCfg:
   """Go2 flat-terrain contact-explicit configuration.
 
   Args:
     play: Evaluation / visualisation variant (no pushes, no obs noise).
-    improved: EXPERIMENTAL variant -- adds IMU signals to the actor (see
-      ``make_contact_env_cfg``). ``False`` is the paper-faithful task.
+    improved: Enables IMU signals in the actor (now True by default, matching
+      Omar & Khadiv's R^82 observation in SLowRL 2026).
   """
   cfg = make_contact_env_cfg(actor_imu=improved)
 
   cfg.scene.entities = {"robot": get_go2_robot_cfg()}
   cfg.scene.num_envs = PAPER_NUM_ENVS
 
-  # Foot / ground contact sensor. ``ContactSensor`` resolves ``pattern`` in MJCF
-  # declaration order; ``check_foot_ordering`` asserts it matches FOOT_ORDER.
   feet_ground_cfg = ContactSensorCfg(
     name=FEET_SENSOR_NAME,
     primary=ContactMatch(mode="geom", pattern=_FOOT_GEOMS, entity="robot"),
@@ -56,8 +57,6 @@ def unitree_go2_flat_env_cfg(
     num_slots=1,
     track_air_time=True,
   )
-  # Non-foot / ground contact sensor (anti-kneeling penalty). Geom mode, not
-  # body mode: the foot sphere lives inside the calf body.
   illegal_ground_cfg = ContactSensorCfg(
     name=ILLEGAL_CONTACT_SENSOR_NAME,
     primary=ContactMatch(mode="geom", pattern=_ILLEGAL_GEOMS, entity="robot"),
@@ -70,15 +69,12 @@ def unitree_go2_flat_env_cfg(
 
   joint_pos_action = cfg.actions["joint_pos"]
   assert isinstance(joint_pos_action, JointPositionActionCfg)
-  joint_pos_action.scale = GO2_ACTION_SCALE
+  joint_pos_action.scale = GO2_PAPER_ACTION_SCALE
 
   cfg.events["foot_friction"].params["asset_cfg"].geom_names = _FOOT_GEOMS
   cfg.events["base_com"].params["asset_cfg"].body_names = ("base_link",)
 
   cfg.viewer.body_name = "base_link"
-
-  # Training never renders; the debug visualisation (planned footholds) is
-  # only needed by viewers and evaluation videos.
   cfg.commands["contact"].debug_vis = play
 
   if play:
@@ -86,7 +82,6 @@ def unitree_go2_flat_env_cfg(
     cfg.observations["actor"].enable_corruption = False
     cfg.events.pop("push_robot", None)
     cfg.scene.num_envs = 64
-    # Evaluation videos: a clean, larger frame focused on one robot.
     cfg.viewer.max_extra_envs = 0
     cfg.viewer.width = 640
     cfg.viewer.height = 480

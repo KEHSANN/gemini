@@ -1,31 +1,20 @@
 """On-policy runner for the contact-explicit task.
 
 Extends mjlab's :class:`MjlabOnPolicyRunner` with
-
 * the paper's **entropy decay** (Section 4, "Training"), applied by wrapping
   ``self.alg.update`` so the coefficient is set right before every PPO update
   inside a *single* ``learn()`` call (resume-aware);
+* **TF32 fast matmul** enabled on CUDA GPUs for faster GRU + MLP updates;
 * **observability**: explained variance, entropy + entropy coefficient,
   iteration / collection / learning time, FPS, GPU memory, written to
   TensorBoard as ``training/*`` and ``system/*`` next to rsl-rl's own scalars;
 * the project **checkpoint layer** (:mod:`contact_rl.utils.checkpoints`):
   atomic ``checkpoints/model_<it>.pt``, ``latest.pt``, ``best.pt`` (by mean
   training episode reward), ``index.json`` and retention;
-* **safe resume**: :meth:`load_for_resume` restores the full training state
-  and continues at ``loaded_iter + 1`` (rsl-rl alone would re-run the loaded
-  iteration and overwrite its checkpoint); the resume source can never be
-  written to;
-* **graceful stop**: :meth:`request_stop` (SIGTERM / SIGINT) finishes the
-  current iteration, always writes a checkpoint, closes the logger (so a W&B
-  run is finished) and raises :class:`TrainingStopped`;
-* **GRU ONNX export** through :mod:`contact_rl.utils.onnx_compat` (rsl-rl
-  5.0.1 declares 2 output names but returns 3 values for GRUs). The export
-  status is reported by :mod:`contact_rl.utils.onnx_export`: a written
-  ``policy.onnx`` is never reported as a failure because the optional wandb
-  package (only used for the metadata run name) is missing.
-
-Without :meth:`configure_run` (e.g. used through mjlab's own CLI) the runner
-behaves like before, with checkpoints under ``<log_dir>/checkpoints``.
+* **non-blocking ONNX export**: exports ``policy.onnx`` only when a new best
+  checkpoint is achieved or on graceful stop (avoiding CPU trace stalls every
+  50 iterations);
+* **safe resume** and **graceful stop**.
 """
 
 from __future__ import annotations
@@ -34,6 +23,8 @@ import os
 import statistics
 import time
 from pathlib import Path
+
+import torch
 
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx, get_base_metadata
@@ -111,8 +102,6 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
   # --------------------------------------------------------------- logging
 
   def _writer(self):
-    """rsl-rl creates ``logger.writer`` lazily in ``init_logging_writer``
-    (inside ``learn``); None before that or when not logging."""
     return getattr(self.logger, "writer", None)
 
   def _wrap_logger(self) -> None:
@@ -167,15 +156,10 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
         flush=True,
       )
     if self._stop_reason is not None:
-      # Always write the stop checkpoint: it must not depend on the logger
-      # having a writer (the TensorBoard/W&B extras above are optional).
-      # ``save`` maps the name onto <run_dir>/checkpoints/model_<it>.pt.
       log_dir = getattr(self.logger, "log_dir", None) or (str(self.run_dir) if self.run_dir else ".")
       self.save(os.path.join(log_dir, f"model_{it}.pt"))
       if writer is not None:
         writer.flush()
-        # rsl-rl's learn() closes the logger only after its loop; we leave the
-        # loop by raising, so close it here (finishes a W&B run cleanly).
         try:
           self.logger.stop_logging_writer()
         except Exception as e:  # noqa: BLE001
@@ -224,7 +208,8 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
       update_run_info(run_dir, last_checkpoint=target.name, last_iteration=it, updated=now_iso())
     if self.cfg.get("upload_model"):
       self.logger.save_model(str(target), it)
-    if self.export_onnx:
+    # Export ONNX when a new best checkpoint is found, on the first save, or on stop.
+    if self.export_onnx and (res["is_best"] or self._stop_reason is not None or not (run_dir / "exported" / "policy.onnx").exists()):
       self._export_onnx(run_dir)
 
   def _export_onnx(self, run_dir: Path) -> None:
@@ -234,7 +219,7 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
       lambda: export_policy_onnx(self.alg.get_policy(), str(out_dir), "policy.onnx"),
       lambda p: attach_metadata_to_onnx(str(p), get_base_metadata(self.env.unwrapped, run_name)),
     )
-    if res["status"] == "failed":  # never kill training for an export; record it loudly
+    if res["status"] == "failed":
       print(f"[ERROR] ONNX export failed (training continues): {res['error']}")
     elif res["status"] == "ok_without_metadata":
       print(f"[WARN] wrote {res['path']} but could not attach metadata: {res['metadata']}")
@@ -259,7 +244,7 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
       self.alg.entropy_coef = entropy_at(it)
       self._entropy_updates += 1
       st = self.alg.storage
-      try:  # returns / values are final here (compute_returns ran)
+      try:
         self._last_ev = explained_variance(st.values, st.returns)
       except Exception:
         self._last_ev = float("nan")
@@ -268,10 +253,14 @@ class ContactOnPolicyRunner(MjlabOnPolicyRunner):
     self.alg.update = update_with_hooks  # type: ignore[method-assign]
     self._update_hooks_installed = True
 
-  # Backwards-compatible name.
   _install_entropy_schedule = _install_update_hooks
 
   def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
+    if torch.cuda.is_available():
+      torch.backends.cuda.matmul.allow_tf32 = True
+      torch.backends.cudnn.allow_tf32 = True
+      if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
     self._entropy_it0 = int(self.current_learning_iteration)
     self._install_update_hooks()
     self._entropy_updates = 0

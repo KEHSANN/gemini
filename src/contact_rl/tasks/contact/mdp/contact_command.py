@@ -3,39 +3,6 @@
 Implements the contact goals of Omar & Khadiv, *Learning to Act Through Contact:
 A Unified View of Multi-Task Robot Learning* (L4DC 2026, arXiv:2510.03599v2),
 Section 3, for a quadruped end-effector set (the four feet).
-
-For each end-effector ``e`` and time ``t`` the planner provides (Section 3.2):
-
-* contact locations for a horizon of two contact switches
-  ``p^con_{e,t} = {p^con_{e,t,1}, p^con_{e,t,2}}`` (current + next),
-* binary contact indicators for the same two switches
-  ``I^con_{e,t} = {I^con_{e,t,1}, I^con_{e,t,2}}``, and
-* the remaining command time ``s`` of the current contact goal (reset to a
-  newly sampled command duration ``S ~ U[0.34, 0.36] s`` when it expires).
-
-Contact phases (Fig. 3) follow from ``I^con_{e,t,1}`` and ``s`` against the
-threshold ``delta``: reach (``I=0, s<=delta``), hold (``I=1``), detach
-(``I=0, s>delta``).
-
-The foothold propagation lives in :class:`~.planning.GaitPlanner` (pure torch,
-unit-tested); this module wires it into mjlab.
-
-Correctness notes (see ``docs/AUDIT.md``):
-
-* **Reset anchoring reads ``qpos``**, not ``xpos``. mjlab calls the command
-  manager's ``reset`` inside ``_reset_idx`` *after* the reset events wrote the
-  new root pose but *before* ``sim.forward()``; derived quantities such as
-  ``root_link_pos_w`` / ``heading_w`` are therefore still those of the
-  *terminated* episode at that point. Anchoring the plan to them (as the
-  previous revision did) placed every new episode's footholds around the pose
-  where the previous episode ended.
-* **Goal discovery does not shorten the command window** by default. The paper
-  defines the contact timing through the command duration ``S`` and evaluates
-  the policy as a function of it (Fig. 6); the previous revision forced a
-  resample on discovery, which fired almost every switch at the dwell gate
-  (``s < S/2 ~= delta``) and so halved the effective ``S`` and removed the
-  reach phase. The old behaviour is kept behind
-  ``discovery_advances_goals=True`` for ablations.
 """
 
 from __future__ import annotations
@@ -82,7 +49,6 @@ class ContactGoalCommand(CommandTerm):
         f"{cfg.resampling_time_range[0]})."
       )
 
-    # ``preserve_order=True``: the resolver defaults to *model* order.
     site_ids, site_names = self.robot.find_sites(
       list(cfg.foot_site_names), preserve_order=True
     )
@@ -104,6 +70,8 @@ class ContactGoalCommand(CommandTerm):
     self._goal_pos_w = torch.zeros(N, NUM_FEET, NUM_SWITCHES, 3, device=dev)
     self._goal_pos_w[..., 2] = cfg.foot_target_height
     self._goal_contact = torch.zeros(N, NUM_FEET, NUM_SWITCHES, device=dev)
+    self._last_foot_dist = torch.zeros(N, NUM_FEET, device=dev)
+    self._phase_cache = None
 
     # Goal-discovery bookkeeping.
     self.just_discovered = torch.zeros(N, device=dev)
@@ -183,7 +151,7 @@ class ContactGoalCommand(CommandTerm):
     self._sync_goals(env_ids)
 
   def _update_command(self) -> None:
-    """Per-step update: build the observation vector and detect discovery."""
+    """Per-step update: build the observation vector and detect goal completion."""
     N = self.num_envs
     goal_b = self._world_to_base(self._goal_pos_w)  # [N, 4, 2, 3]
     n_pos = NUM_FEET * NUM_SWITCHES * 3
@@ -192,14 +160,20 @@ class ContactGoalCommand(CommandTerm):
     self._command[:, n_pos : n_pos + n_con] = self._goal_contact.reshape(N, n_con)
     self._command[:, -1] = torch.clamp(self.time_left, min=0.0)
 
-    # Goal discovery: base (projected to the ground) within a threshold of the
-    # centroid of the current footholds, after dwelling for part of the window
-    # (the paper's "*remains* within a threshold"). Branch-free: no host sync.
+    # Goal discovery / completion: require both base proximity to the foothold
+    # centroid AND accurate stance foot placement (< goal_proximity_threshold)
+    # so the bonus is earned by genuine contact tracking rather than for free.
     base_xy = self.robot.data.root_link_pos_w[:, :2]
     centroid = self._goal_pos_w[:, :, 0, :2].mean(dim=1)
-    dist = torch.norm(base_xy - centroid, dim=-1)
+    dist_base = torch.norm(base_xy - centroid, dim=-1)
+
+    stance_mask = (self._goal_contact[:, :, 0] > 0.5).float()
+    stance_cnt = torch.clamp(stance_mask.sum(dim=1), min=1.0)
+    stance_foot_err = (self._last_foot_dist * stance_mask).sum(dim=1) / stance_cnt
+
     reached = (
-      (dist < self.cfg.goal_proximity_threshold)
+      (dist_base < self.cfg.goal_proximity_threshold)
+      & (stance_foot_err < self.cfg.goal_proximity_threshold)
       & (~self._discovered_this_switch)
       & (self.time_left < self._dwell_time_left_max)
     )
@@ -215,6 +189,7 @@ class ContactGoalCommand(CommandTerm):
     self._skip_metrics.fill_(False)
     foot = self.foot_pos_w()
     dist = torch.norm(self._goal_pos_w[:, :, 0, :] - foot, dim=-1)  # [N, 4]
+    self._last_foot_dist.copy_(dist)
     self._m_steps += valid
     self._m_track += valid * dist.mean(dim=1)
     denom = torch.clamp(self._m_steps, min=1.0)
@@ -223,10 +198,7 @@ class ContactGoalCommand(CommandTerm):
     if self._sensor is not None:
       i_con = self._goal_contact[:, :, 0]
       i_act = self.actual_contact()
-      # Fig. 6: Hamming distance between the desired contact plan and the
-      # actual contact status (feet in disagreement, per step) ...
       self._m_hamming += valid * (torch.abs(i_con - i_act)).sum(dim=1)
-      # ... and the L2 contact-location error while making contact.
       in_contact = (i_con > 0.5) & (i_act > 0.5)
       self._m_loc_sum += valid * (dist * in_contact).sum(dim=1)
       self._m_loc_cnt += valid * in_contact.float().sum(dim=1)
@@ -238,8 +210,6 @@ class ContactGoalCommand(CommandTerm):
   # ---------------------------------------------------------- debug vis
 
   def _debug_vis_impl(self, visualizer: DebugVisualizer) -> None:
-    """p1 solid, p2 faded; green = contact commanded, red = swing. Orange arrow:
-    swing foot -> p1 (the vector the reach reward shrinks)."""
     goal = self._goal_pos_w
     con = self._goal_contact
     feet = self.robot.data.site_pos_w
@@ -278,12 +248,10 @@ class ContactGoalCommand(CommandTerm):
 
   @property
   def goal_pos_w(self) -> torch.Tensor:
-    """World contact locations, ``[N, 4, 2, 3]`` (foot, {current,next}, xyz)."""
     return self._goal_pos_w
 
   @property
   def current_contact_goal(self) -> torch.Tensor:
-    """Current binary contact indicator ``I^con_{e,t,1}``, ``[N, 4]``."""
     return self._goal_contact[:, :, 0]
 
   @property
@@ -292,7 +260,6 @@ class ContactGoalCommand(CommandTerm):
 
   @property
   def time_remaining(self) -> torch.Tensor:
-    """Remaining command time ``s``, ``[N]``."""
     return self.time_left
 
   @property
@@ -307,8 +274,6 @@ class ContactGoalCommandCfg(CommandTermCfg):
   entity_name: str = "robot"
   foot_site_names: tuple[str, ...] = FOOT_ORDER
   sensor_name: str | None = None
-  """Feet contact sensor; enables the paper's Fig. 6 metrics
-  (``contact_plan_hamming``, ``contact_location_error``)."""
   hip_x: tuple[float, ...] = GO2_HIP_X
 
   # Command duration S ~ U[0.34, 0.36] s (Section 4).
@@ -321,30 +286,18 @@ class ContactGoalCommandCfg(CommandTermCfg):
   heading_range: tuple[float, float] = (-3.141592653589793, 3.141592653589793)
   yaw_rate_range: tuple[float, float] = (-3.141592653589793, 3.141592653589793)
   rel_yaw_rate_envs: float = 0.5
-  """Fraction of environments following a curved path (yaw rate) instead of a
-  fixed heading (paper: "a sampled heading ... *or* a sampled yaw rate")."""
 
   gaits: tuple[str, ...] | None = None
-  """Subset of gaits to sample from; ``None`` uses all of :data:`GAITS`."""
 
   delta: float = 0.18
-  """Contact-phase threshold ``delta`` on the remaining command time ``s``
-  (unspecified in the paper; ~S/2 splits swing into detach then reach)."""
-
   foot_target_height: float = 0.02
-  """Target z of a planted foot site (approx. foot sphere radius)."""
 
-  goal_proximity_threshold: float = 0.15
-  """Base-to-foothold-centroid distance that counts as a discovered goal."""
+  # Tightened from 0.15 m to 0.06 m and gated on stance foot error so the bonus
+  # rewards genuine contact goal completion rather than firing every switch.
+  goal_proximity_threshold: float = 0.06
 
   goal_dwell_frac: float = 0.5
-  """Fraction of the command window that must elapse before discovery can fire
-  (at most one discovery per switch)."""
-
   discovery_advances_goals: bool = False
-  """Legacy: force an early goal switch on discovery. Off by default because
-  it overrides the commanded contact timing ``S`` (see module docstring)."""
-
   debug_vis: bool = True
 
   def build(self, env: ManagerBasedRlEnv) -> ContactGoalCommand:

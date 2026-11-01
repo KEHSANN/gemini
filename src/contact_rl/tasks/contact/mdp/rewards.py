@@ -1,27 +1,18 @@
 """Contact-explicit rewards for the locomotion task.
 
 Implements the reach / hold / detach rewards of Omar & Khadiv (Section 3.2,
-Eq. 1-3) plus the paper's auxiliary locomotion penalties and the goal-discovery
-bonus (Section 4, "Locomotion"):
+Eq. 1-3) plus foot clearance and slip regularisation (SLowRL, Omar & Khadiv
+2026, Section 5), auxiliary locomotion penalties, and the goal-discovery bonus:
 
-  r_reach  = exp(-d(p1, p_act) / sigma^2) * 1[I^con_1 = 0 and s <= delta]      (1)
-  r_hold   = (1 + a_hold * exp(-d / sigma^2)) * 1[I^con_1 = I^act = 1]         (2)
-  r_detach = 1[I^con_1 = I^act = 0 and s > delta]                               (3)
+  r_reach     = exp(-d(p1, p_act) / sigma^2) * 1[I^con_1 = 0 and s <= delta]   (1)
+  r_hold      = (1 + a_hold * exp(-d / sigma^2)) * 1[I^con_1 = I^act = 1]      (2)
+  r_detach    = 1[I^con_1 = I^act = 0 and s > delta]                            (3)
+  r_clearance = exp(-(max(h_target - z_foot, 0))^2 / 0.0025) * 1[detach]
+  r_slip      = ||v_{xy,foot}||^2 * 1[hold]
 
-``d`` is the *unsquared* L2 distance (paper, Eq. 1-2). ``kernel="gaussian"``
-selects ``exp(-d^2 / sigma^2)`` -- the form of the previous revision -- for
-ablations. Each term is summed over feet and exposed as its own reward term so
-it can be weighted / logged independently.
-
-Foot-column ordering is asserted at startup by ``check_foot_ordering``.
-
-Posture regularisation (not in the paper, added after the 2000-iteration run
-learned to walk on its hind knees): the contact rewards only see the foot
-sites / foot geoms, so a kneeling leg whose foot sphere still touches the goal
-is paid in full. ``undesired_contact_count``, ``base_height_below``,
-``base_tilt_l2`` and ``knee_height_below`` close that loophole. The binary
-contact count alone is not enough: a knee hovering a few mm above the floor
-costs nothing, so ``knee_height_below`` adds a dense, geometric penalty.
+Per-step phase masks and foot-to-goal distances are cached on the command term
+keyed by ``env.common_step_counter`` so all 5 contact reward terms share a
+single GPU calculation per environment step.
 """
 
 from __future__ import annotations
@@ -56,8 +47,13 @@ def _phase_inputs(
   sensor_name: str,
   asset_cfg: SceneEntityCfg,
 ):
-  """Return (term, dist [N,4], reach, hold, detach masks [N,4])."""
+  """Return (term, dist [N,4], reach, hold, detach masks [N,4]), cached per step."""
   term = _term(env, command_name)
+  step_id = getattr(env, "common_step_counter", None)
+  cache = getattr(term, "_phase_cache", None)
+  if step_id is not None and cache is not None and cache[0] == step_id:
+    return term, cache[1], cache[2], cache[3], cache[4]
+
   asset: Entity = env.scene[asset_cfg.name]
   sensor: ContactSensor = env.scene[sensor_name]
   if sensor.data.found is None:
@@ -69,6 +65,8 @@ def _phase_inputs(
   reach, hold, detach = phase_masks(
     term.current_contact_goal, i_act, term.time_remaining, term.cfg.delta
   )
+  if step_id is not None:
+    term._phase_cache = (step_id, dist, reach, hold, detach)
   return term, dist, reach, hold, detach
 
 
@@ -76,7 +74,7 @@ def contact_reach(
   env: ManagerBasedRlEnv,
   command_name: str,
   sensor_name: str,
-  sigma_sq: float = 0.1,
+  sigma_sq: float = 0.04,
   kernel: str = "l2",
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -90,7 +88,7 @@ def contact_hold(
   command_name: str,
   sensor_name: str,
   hold_alpha: float = 1.0,
-  sigma_sq: float = 0.1,
+  sigma_sq: float = 0.04,
   kernel: str = "l2",
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
@@ -111,8 +109,41 @@ def contact_detach(
   return detach.float().sum(dim=1)
 
 
+def contact_foot_clearance(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str,
+  target_height: float = 0.08,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Reward lifting swinging feet to ``target_height`` during the detach phase.
+
+  Prevents feet from skimming millimetres above the ground during swing, which
+  causes premature ground strikes (high Hamming error) and poor landing accuracy.
+  """
+  term, _, _, _, detach = _phase_inputs(env, command_name, sensor_name, asset_cfg)
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_z = asset.data.site_pos_w[:, term.foot_site_ids, 2]  # [N, 4]
+  deficit_sq = torch.square(torch.clamp(target_height - foot_z, min=0.0))
+  return (torch.exp(-deficit_sq / 0.0025) * detach.float()).sum(dim=1)
+
+
+def contact_foot_slip(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  sensor_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+  """Penalize horizontal foot sliding velocity while in the hold phase."""
+  term, _, _, hold, _ = _phase_inputs(env, command_name, sensor_name, asset_cfg)
+  asset: Entity = env.scene[asset_cfg.name]
+  foot_vel_xy = asset.data.site_lin_vel_w[:, term.foot_site_ids, :2]  # [N, 4, 2]
+  vel_sq = torch.sum(torch.square(foot_vel_xy), dim=-1)  # [N, 4]
+  return (vel_sq * hold.float()).sum(dim=1)
+
+
 def goal_discovery_bonus(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
-  """Bonus for discovering more goals (at most once per contact switch)."""
+  """Bonus for discovering / completing goals (at most once per contact switch)."""
   return _term(env, command_name).just_discovered
 
 
@@ -161,13 +192,7 @@ def base_height_below(
   target: float = 0.25,
   asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-  """One-sided, linear: ``max(target - z_base, 0)`` (flat terrain).
-
-  Linear rather than squared so small drops still register. One-sided so
-  jumps are never penalised. NOTE: measured at the base centre, so kneeling on
-  the hind legs only (front legs straight) barely moves it; the dense
-  anti-kneeling signal is ``knee_height_below``.
-  """
+  """One-sided, linear: ``max(target - z_base, 0)`` (flat terrain)."""
   asset: Entity = env.scene[asset_cfg.name]
   z = asset.data.root_link_pos_w[:, 2]
   return torch.clamp(target - z, min=0.0)
@@ -188,16 +213,7 @@ def knee_height_below(
   asset_cfg: SceneEntityCfg,
   min_height: float = 0.08,
 ) -> torch.Tensor:
-  """Dense anti-kneeling penalty (flat terrain), summed over legs.
-
-  ``sum_legs max(min_height - z_knee, 0) / min_height`` in [0, n_legs], where
-  ``z_knee`` is the world height of the calf body origin (= knee joint).
-  ``asset_cfg.body_names`` must select the calf bodies (e.g. ``".*_calf"``).
-
-  Go2: nominal knee height ~0.155 m, kneeling ~0.015 m. Unlike the binary
-  ``undesired_contact_count`` it cannot be gamed by hovering the knee a few mm
-  above the floor, and it gives a gradient before touch-down.
-  """
+  """Dense anti-kneeling penalty (flat terrain), summed over legs."""
   asset: Entity = env.scene[asset_cfg.name]
   z = asset.data.body_link_pos_w[:, asset_cfg.body_ids, 2]
   return (torch.clamp(min_height - z, min=0.0) / min_height).sum(dim=1)

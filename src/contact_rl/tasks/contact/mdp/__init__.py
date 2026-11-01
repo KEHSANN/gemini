@@ -29,6 +29,8 @@ from .rewards import (  # noqa: F401
   base_height_below,
   base_tilt_l2,
   contact_detach,
+  contact_foot_clearance,
+  contact_foot_slip,
   contact_hold,
   contact_reach,
   goal_discovery_bonus,
