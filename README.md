@@ -24,8 +24,8 @@ for the paper/code gap analysis.
 
 | Task id | What |
 | --- | --- |
-| `Mjlab-Contact-Flat-Unitree-Go2` | Paper-faithful implementation (default). Runs under `runs/go2_contact/`. |
-| `Mjlab-Contact-Flat-Unitree-Go2-Improved` | **Experimental**: + IMU (base angular velocity, projected gravity) in the actor and running observation normalisation on actor *and* critic. Runs under `runs/go2_contact_improved/`. |
+| `Mjlab-Contact-Flat-Unitree-Go2` | Default. Actor observations include IMU (base angular velocity, projected gravity) and running observation normalisation is on for actor *and* critic. Runs under `runs/go2_contact/`. |
+| `Mjlab-Contact-Flat-Unitree-Go2-Improved` | Same configuration as the default task; only the run directory differs (`runs/go2_contact_improved/`). |
 
 ### The contact goal
 
@@ -41,13 +41,14 @@ hold   = (1 + alpha_hold * exp(-d / sigma^2)) * 1[I^con_1 = I^act = 1]
 detach = 1[I^con_1 = I^act = 0 and s > delta]
 ```
 
-sigma^2 = 0.1 m, alpha_hold = 1. Planner: `mdp/planning.py`. Actor observations:
-joint pos/vel, last action, contact goal, feet-to-goal vectors; the critic adds
-privileged base velocities, projected gravity and foot contact.
+sigma^2 = 0.04 m, alpha_hold = 1. Planner: `mdp/planning.py`. Actor observations
+(87 dims): joint pos/vel (12 + 12), last action (12), contact goal (33),
+feet-to-goal vectors (12), base angular velocity (3) and projected gravity (3);
+the critic adds privileged base linear velocity and foot contact.
 
 PPO, recurrent GRU actor & critic (rsl-rl `RNNModel`, 256 hidden, MLP head
 512-256-128), 24 steps/env, 5 epochs x 4 mini-batches, adaptive LR 1e-3,
-gamma 0.99, lambda 0.95, entropy decay 0.01 -> 0.001 over 5000 iterations, seed 42.
+gamma 0.99, lambda 0.95, entropy decay 0.008 -> 0.001 over 2500 iterations, seed 42.
 
 ### Posture regularisation (not in the paper)
 
@@ -149,6 +150,13 @@ uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --env.scene.num-envs 4096
 uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 --resume-from runs/go2_contact/<run>:best
 ```
 
+> **Do not resume pre-optimisation checkpoints.** The actor observation grew
+> from 81 to 87 dims (the 6 IMU dims above), so any checkpoint trained before
+> this change — including the committed 2000-iteration run — has an 81-wide
+> actor input layer and cannot be resumed with `--resume-from`. Start training
+> from iteration 0 instead. No new dependencies were introduced:
+> `pyproject.toml` and `uv.lock` are unchanged.
+
 All mjlab `TrainConfig` flags work (`--env.*`, `--agent.*`, `--video`,
 `--gpu-ids`, `--enable-nan-guard True` -> `env.sim.nan_guard.enabled`), plus
 `--resume-from`, `--device`, `--run-root`, `--keep-last`, `--keep-every`,
@@ -162,15 +170,19 @@ ignored.
 
 ## Continuing training from a finished checkpoint
 
+Only checkpoints trained with the current 87-dim actor observation can be
+resumed (see the warning in Training above); pre-optimisation checkpoints
+must be retrained from scratch.
+
 A run that reached `max_iterations` (`status: "finished"`) is resumed exactly
-like a stopped one. Example: the committed 2000-iteration checkpoint
-(`model_1999.pt` = iterations 0..1999), 3000 more iterations up to 5000:
+like a stopped one. Example: a finished run stopped at iteration 1999, 3000
+more iterations up to 5000:
 
 ```bash
 uv run contact-train Mjlab-Contact-Flat-Unitree-Go2 \
-  --resume-from runs/go2_contact/2026-10-01_04-21-51/checkpoints/model_1999.pt \
+  --resume-from runs/go2_contact/<run>/checkpoints/model_1999.pt \
   --agent.max-iterations 3000
-# equivalent selector: runs/go2_contact/2026-10-01_04-21-51:1999
+# equivalent selector: runs/go2_contact/<run>:1999
 ```
 
 - `--agent.max-iterations` is the number of **additional** iterations

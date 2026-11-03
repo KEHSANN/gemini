@@ -1,9 +1,11 @@
 """Registration of the Unitree Go2 contact-explicit tasks.
 
-* ``Mjlab-Contact-Flat-Unitree-Go2``          -- paper-faithful (default).
-* ``Mjlab-Contact-Flat-Unitree-Go2-Improved`` -- EXPERIMENTAL: + IMU in the
-  actor and running observation normalisation. Everything else identical, so
-  the two are directly comparable.
+Both tasks now run the optimised setup: 87-dim actor observation with IMU
+signals and running observation normalisation, fast PPO schedule
+(max_iter 5000, KL 0.015). They differ only in the run folder:
+
+* ``Mjlab-Contact-Flat-Unitree-Go2``          -- runs/go2_contact (default).
+* ``Mjlab-Contact-Flat-Unitree-Go2-Improved`` -- runs/go2_contact_improved.
 """
 
 from mjlab.tasks.registry import register_mjlab_task
